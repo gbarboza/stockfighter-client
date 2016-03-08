@@ -35,7 +35,23 @@ const (
 
 type Stockfighter interface {
 	Heartbeat() bool
+
 	VenueHeartbeat(venue string) bool
+	VenueStocks(venue string) []SymbolInfo
+
+	Orderbook(venue string, stock string) OrderbookResponse
+
+	Quote(venue string, stock string) Quote
+
+	PlaceOrder(order OrderRequest) OrderResponse
+	CancelOrder(venue string, stock string, id int) OrderResponse
+
+	Order(venue string, stock string, id int) OrderResponse
+	VenueOrders(venue string, account string) []OrderResponse
+	StockOrders(venue string, stock string, account string) []OrderResponse
+
+	HandleNewQuote()
+	HandleNewOrder()
 }
 
 type HasOk struct {
@@ -47,14 +63,19 @@ type StatusResponse struct {
 	Error string `json:"error"`
 }
 
-type StocksResponse struct {
+type VenueStatusResponse struct {
 	HasOk
-	Symbols []Symbol `json:"symbols"`
+	Venue string `json:"venue"`
 }
 
-type Symbol struct {
+type SymbolInfo struct {
 	Name   string `json:"name"`
 	Symbol string `json:"symbol"`
+}
+
+type VenueStocksResponse struct {
+	HasOk
+	Symbols []SymbolInfo `json:"symbols"`
 }
 
 type Order struct {
@@ -62,17 +83,17 @@ type Order struct {
 	Quantity uint64 `json:"qty"`
 }
 
-type OrderResponse struct {
-	HasOk
-	Symbol
-	Bids      []OrderbookOrder `json:"bids"`
-	Asks      []OrderbookOrder `json:"asks"`
-	Timestamp time.Time        `json:"ts"`
-}
-
-type OrderbookOrder struct {
+type OrderbookEntry struct {
 	Order
 	IsBuy bool `json:"isBuy"`
+}
+
+type OrderbookResponse struct {
+	VenueStatusResponse
+	Symbol    string           `json:"symbol"`
+	Bids      []OrderbookEntry `json:"bids"`
+	Asks      []OrderbookEntry `json:"asks"`
+	Timestamp time.Time        `json:"ts"`
 }
 
 type OrderRequest struct {
@@ -83,9 +104,29 @@ type OrderRequest struct {
 	Price     int    `json:"price"`
 }
 
+type Fill struct {
+	Qty       int       `json:"qty"`
+	Price     int       `json:"price"`
+	Timestamp time.Time `json:"ts"`
+}
+
+type OrderResponse struct {
+	VenueStatusResponse
+	OrderRequest
+	OriginalQty int `json:"originalQty"`
+
+	Id        int       `json:"id"`
+	Timestamp time.Time `json:"ts"`
+
+	Fills       []Fill `json:"fills"`
+	TotalFilled int    `json:"totalFilled"`
+
+	Open bool `json:"open"`
+}
+
 type Quote struct {
-	HasOk
-	Symbol
+	VenueStatusResponse
+	Symbol string `json:"symbol"`
 
 	Bid      int `json:"bid"`
 	BidSize  int `json:"bidSize"`
@@ -99,6 +140,11 @@ type Quote struct {
 
 	LastTrade time.Time `json:"lastTrade"`
 	QuoteTime time.Time `json:"quoteTime"`
+}
+
+type OrdersStatusResponse struct {
+	VenueStatusResponse
+	Orders []OrderResponse `json:"orders"`
 }
 
 type Client struct {
@@ -143,7 +189,7 @@ func (c Client) VenueHeartbeat(venue string) bool {
 		return false
 	}
 
-	s := new(StatusResponse)
+	s := new(VenueStatusResponse)
 	err = json.NewDecoder(resp.Body).Decode(&s)
 
 	if s.Ok != true {
@@ -166,7 +212,7 @@ func (c Client) VenueStocks(venue string) []Symbol {
 		return nil
 	}
 
-	stocks := new(StocksResponse)
+	stocks := new(VenueStocksResponse)
 	err = json.NewDecoder(resp.Body).Decode(stocks)
 
 	if err != nil {
@@ -211,6 +257,13 @@ func (c Client) PlaceOrder(venue string, stock string, account string, price int
 	// }
 
 	// resp, err := http.Post(fmt.Sprintf(VENUE_POST_ORDER, venue, stock), payload)
+}
+
+func (c Client) CancelOrder(venue string, stock string, id int) OrderResponse {
+}
+
+func Run(client Stockfighter) {
+
 }
 
 func main() {

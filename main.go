@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	_ "io/ioutil"
@@ -12,9 +13,16 @@ import (
 const (
 	HEARTBEAT_URL       = "https://api.stockfighter.io/ob/api/heartbeat"
 	VENUE_HEARTBEAT_URL = "https://api.stockfighter.io/ob/api/venues/%s/heartbeat"
+
 	VENUE_STOCKS_URL    = "https://api.stockfighter.io/ob/api/venues/%s/stocks"
-	VENUE_ORDERS_URL    = "https://api.stockfighter.io/ob/api/venues/%s/stocks/%s"
-	VENUE_POST_ORDER    = "https://api.stockfighter.io/ob/api/venues/%s/stocks/%s/orders"
+	VENUE_ORDERBOOK_URL = "https://api.stockfighter.io/ob/api/venues/%s/stocks/%s"
+	VENUE_QUOTE_URL     = "https://api.stockfighter.io/ob/api/venues/%s/stocks/%s/quote"
+
+	VENUE_ORDERS_URL = "https://api.stockfighter.io/ob/api/venues/%s/stocks/%s/orders"
+	VENUE_ORDER_URL  = "https://api.stockfighter.io/ob/api/venues/%s/stocks/%s/orders/%d"
+
+	ACCT_EVERY_ORDERS_URL = "https://api.stockfighter.io/ob/api/venues/%s/accounts/%s/orders"
+	ACCT_STOCK_ORDERS_URL = "https://api.stockfighter.io/ob/api/venues/%s/accounts/%s/stocks/%s/orders"
 )
 
 type Direction string
@@ -34,21 +42,20 @@ const (
 )
 
 type Stockfighter interface {
-	Heartbeat() bool
+	Ping() bool
 
-	VenueHeartbeat(venue string) bool
-	VenueStocks(venue string) []SymbolInfo
+	PingVenue(venue string) bool
 
-	Orderbook(venue string, stock string) OrderbookResponse
+	FetchStocks(venue string) []SymbolInfo
+	FetchOrderbook(venue string, stock string) *OrderbookResponse
+	FetchQuote(venue string, stock string) *QuoteResponse
 
-	Quote(venue string, stock string) Quote
+	FetchOrder(venue string, stock string, id int) *OrderResponse
+	PlaceOrder(venue string, stock string, order OrderRequest) *OrderResponse
+	CancelOrder(venue string, stock string, id int) bool
 
-	PlaceOrder(order OrderRequest) OrderResponse
-	CancelOrder(venue string, stock string, id int) OrderResponse
-
-	Order(venue string, stock string, id int) OrderResponse
-	VenueOrders(venue string, account string) []OrderResponse
-	StockOrders(venue string, stock string, account string) []OrderResponse
+	FetchAcctOrders(venue string, account string) []OrderResponse
+	FetchAcctStockOrders(venue string, stock string, account string) []OrderResponse
 
 	HandleNewQuote()
 	HandleNewOrder()
@@ -124,7 +131,12 @@ type OrderResponse struct {
 	Open bool `json:"open"`
 }
 
-type Quote struct {
+type OrdersStatusResponse struct {
+	VenueStatusResponse
+	Orders []OrderResponse `json:"orders"`
+}
+
+type QuoteResponse struct {
 	VenueStatusResponse
 	Symbol string `json:"symbol"`
 
@@ -142,32 +154,51 @@ type Quote struct {
 	QuoteTime time.Time `json:"quoteTime"`
 }
 
-type OrdersStatusResponse struct {
-	VenueStatusResponse
-	Orders []OrderResponse `json:"orders"`
-}
-
 type Client struct {
 	apiKey string
 }
 
-func (c Client) Heartbeat() bool {
-	fmt.Println("Welcome!")
+func PerformRequest(url string, method string, body *string, js interface{}) error {
+	var resp *http.Response
+	var err error
 
-	resp, err := http.Get(HEARTBEAT_URL)
+	switch {
+	case method == http.MethodGet:
+		resp, err = http.Get(url)
+	case method == http.MethodPost:
+		resp, err = http.Post(url, *body, nil)
+	case method == http.MethodDelete:
+		req, err := http.NewRequest(method, url, nil)
+		if err != nil {
+			return err
+		}
+
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+	}
 
 	if err != nil {
-		return false
+		return errors.New(fmt.Sprintf("Request failed: %d", resp.StatusCode))
 	}
 
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return false
+	if err = json.NewDecoder(resp.Body).Decode(&js); err != nil {
+		return err
 	}
 
+	return nil
+}
+
+func (c Client) Ping() bool {
 	s := new(StatusResponse)
-	err = json.NewDecoder(resp.Body).Decode(&s)
+	err := PerformRequest(HEARTBEAT_URL, http.MethodGet, nil, &s)
+
+	if err != nil {
+		return false
+	}
 
 	if s.Ok != true {
 		return false
@@ -176,21 +207,13 @@ func (c Client) Heartbeat() bool {
 	return true
 }
 
-func (c Client) VenueHeartbeat(venue string) bool {
-	resp, err := http.Get(fmt.Sprintf(VENUE_HEARTBEAT_URL, venue))
-
-	if err != nil {
-		return false
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return false
-	}
-
+func (c Client) PingVenue(venue string) bool {
 	s := new(VenueStatusResponse)
-	err = json.NewDecoder(resp.Body).Decode(&s)
+	err := PerformRequest(fmt.Sprintf(VENUE_HEARTBEAT_URL, venue), http.MethodGet, nil, &s)
+
+	if err != nil {
+		return false
+	}
 
 	if s.Ok != true {
 		return false
@@ -199,71 +222,158 @@ func (c Client) VenueHeartbeat(venue string) bool {
 	return true
 }
 
-func (c Client) VenueStocks(venue string) []Symbol {
-	resp, err := http.Get(fmt.Sprintf(VENUE_STOCKS_URL, venue))
+func (c Client) FetchStocks(venue string) []SymbolInfo {
+	s := new(VenueStocksResponse)
+	err := PerformRequest(fmt.Sprintf(VENUE_STOCKS_URL, venue), http.MethodGet, nil, &s)
 
 	if err != nil {
 		return nil
 	}
 
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
+	if s.Ok != true {
 		return nil
 	}
 
-	stocks := new(VenueStocksResponse)
-	err = json.NewDecoder(resp.Body).Decode(stocks)
+	return s.Symbols
+}
+
+func (c Client) FetchOrder(venue string, stock string, id int) *OrderResponse {
+	s := new(OrderResponse)
+	err := PerformRequest(fmt.Sprintf(VENUE_ORDER_URL, venue, stock, id), http.MethodGet, nil, &s)
 
 	if err != nil {
 		return nil
 	}
 
-	return stocks.Symbols
+	if s.Ok != true {
+		return nil
+	}
+
+	if s.Venue != venue {
+		return nil
+	}
+
+	return s
 }
 
-func (c Client) VenueOrders(venue string, stock string) *OrderResponse {
-	resp, err := http.Get(fmt.Sprintf(VENUE_ORDERS_URL, venue, stock))
+func (c Client) FetchOrderbook(venue string, stock string) *OrderbookResponse {
+	s := new(OrderbookResponse)
+	err := PerformRequest(fmt.Sprintf(VENUE_ORDERBOOK_URL, venue, stock), http.MethodGet, nil, &s)
 
 	if err != nil {
 		return nil
 	}
 
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
+	if s.Ok != true {
 		return nil
 	}
 
-	if resp.StatusCode != 200 {
+	if s.Venue != venue {
 		return nil
 	}
 
-	orders := new(OrderResponse)
-	err = json.NewDecoder(resp.Body).Decode(orders)
+	if s.Symbol != stock {
+		return nil
+	}
 
-	return orders
+	return s
 }
 
-func (c Client) PlaceOrder(venue string, stock string, account string, price int, qty int, dir Direction, otype OrderType) {
+func (c Client) FetchAcctOrders(venue string, account string) []OrderResponse {
+	s := new(OrdersStatusResponse)
+	err := PerformRequest(fmt.Sprintf(ACCT_EVERY_ORDERS_URL, account, venue), http.MethodGet, nil, &s)
 
-	or := OrderRequest{account, string(otype), string(dir), qty, price}
-	or = or
-	// json.NewEncoder(or)
-	// payload, err := json.Marshal(or)
+	if err != nil {
+		return nil
+	}
 
-	// if err != nil {
-	// 	return
-	// }
+	if s.Ok != true {
+		return nil
+	}
 
-	// resp, err := http.Post(fmt.Sprintf(VENUE_POST_ORDER, venue, stock), payload)
+	if s.Venue != venue {
+		return nil
+	}
+
+	return s.Orders
 }
 
-func (c Client) CancelOrder(venue string, stock string, id int) OrderResponse {
+func (c Client) FetchAcctStockOrders(venue string, stock string, account string) []OrderResponse {
+	s := new(OrdersStatusResponse)
+	err := PerformRequest(fmt.Sprintf(ACCT_STOCK_ORDERS_URL, account, venue, stock), http.MethodGet, nil, &s)
+
+	if err != nil {
+		return nil
+	}
+
+	if s.Ok != true {
+		return nil
+	}
+
+	if s.Venue != venue {
+		return nil
+	}
+
+	return s.Orders
+}
+
+func (c Client) PlaceOrder(venue string, stock string, order OrderRequest) *OrderResponse {
+	payload, err := json.Marshal(order)
+
+	if err != nil {
+		return nil
+	}
+
+	s := new(OrderResponse)
+	js := string(payload)
+	err = PerformRequest(fmt.Sprintf(VENUE_ORDERS_URL, venue, stock), http.MethodPost, &js, &s)
+
+	return nil
+}
+
+func (c Client) FetchQuote(venue string, stock string) *QuoteResponse {
+	s := new(QuoteResponse)
+	err := PerformRequest(fmt.Sprintf(VENUE_QUOTE_URL, venue, stock), http.MethodGet, nil, &s)
+
+	if err != nil {
+		return nil
+	}
+
+	if s.Ok != true {
+		return nil
+	}
+
+	return s
+}
+
+func (c Client) CancelOrder(venue string, stock string, id int) bool {
+	s := new(OrderResponse)
+	err := PerformRequest(fmt.Sprintf(VENUE_ORDER_URL, venue, stock, id), http.MethodDelete, nil, &s)
+
+	if err != nil {
+		return false
+	}
+
+	if s.Ok != true {
+		return false
+	}
+
+	if s.Open != false {
+		return false
+	}
+
+	return true
+}
+
+func (c Client) HandleNewQuote() {
+
+}
+
+func (c Client) HandleNewOrder() {
+
 }
 
 func Run(client Stockfighter) {
-
 }
 
 func main() {
@@ -271,9 +381,5 @@ func main() {
 	flag.Parse()
 	c := Client{*key}
 
-	// ok := c.Heartbeat()
-	// ok := c.VenueHeartbeat("TESTEX")
-	// stocks := c.VenueStocks("TESTEX")
-	orders := c.VenueOrders("TESTEX", "FOOBAR")
-	fmt.Println(orders.Timestamp.Date())
+	Run(c)
 }
